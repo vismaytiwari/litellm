@@ -17,6 +17,8 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AsyncGenerator,
+    Awaitable,
+    Callable,
     Dict,
     List,
     Literal,
@@ -54,7 +56,14 @@ from litellm.types.proxy.guardrails.guardrail_hooks.presidio import (
     PresidioAnalyzeRequest,
     PresidioAnalyzeResponseItem,
 )
-from litellm.types.utils import GuardrailStatus, StreamingChoices
+from litellm.types.utils import (
+    ChatCompletionDeltaToolCall,
+    Delta,
+    Function,
+    FunctionCall,
+    GuardrailStatus,
+    StreamingChoices,
+)
 from litellm.utils import (
     EmbeddingResponse,
     ImageResponse,
@@ -1154,84 +1163,320 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         )
         return response
 
+    @staticmethod
+    def _unmask_hold_len(text: str, token_keys: Any) -> int:
+        """Length of the trailing run of ``text`` that could still grow into a
+        PII placeholder token, so the unmask path holds it until the next chunk
+        completes (or aborts) the token instead of emitting a half-written
+        ``<PERSON_1>``."""
+        keys = tuple(token_keys)
+        if not text or not keys:
+            return 0
+        longest = max(len(key) for key in keys)
+        for start in range(max(0, len(text) - (longest - 1)), len(text)):
+            suffix = text[start:]
+            if any(key.startswith(suffix) for key in keys if len(suffix) < len(key)):
+                return len(text) - start
+        return 0
+
+    @staticmethod
+    def _mask_flush_index(text: str) -> int:
+        """Index up to which ``text`` is safe to mask and emit now. A sentence
+        terminator followed by whitespace (or a newline) never falls inside a
+        PII entity, so each flushed window is a complete Presidio analyze unit.
+        A terminator at the very end of the buffer is not yet a boundary: the
+        next chunk may continue the token (``jane.`` + ``doe@example.com``), so
+        it is held until the following whitespace arrives. Text past the last
+        boundary is held until a later boundary or the end of the stream;
+        emitting it early could split an entity across two analyze calls and leak
+        it unmasked, so latency yields to correctness."""
+        boundaries = tuple(
+            i + 1
+            for i in range(len(text))
+            if text[i] == "\n"
+            or (text[i] in ".!?" and i + 1 < len(text) and text[i + 1].isspace())
+        )
+        return boundaries[-1] if boundaries else 0
+
+    @staticmethod
+    def _accumulate_tool_calls(
+        tool_acc: dict[int, dict[int, dict[str, Optional[str]]]],
+        choice_index: int,
+        tool_calls: list[Any],
+    ) -> None:
+        choice_acc = tool_acc.setdefault(
+            choice_index, {}
+        )  # mutable-ok: streaming tool-call accumulator
+        for tool_call in tool_calls:
+            entry = (
+                choice_acc.setdefault(  # mutable-ok: streaming tool-call accumulator
+                    getattr(tool_call, "index", 0) or 0,
+                    {"id": None, "type": None, "name": None, "args": ""},
+                )
+            )
+            if getattr(tool_call, "id", None):
+                entry["id"] = tool_call.id
+            if getattr(tool_call, "type", None):
+                entry["type"] = tool_call.type
+            function = getattr(tool_call, "function", None)
+            if function is not None:
+                if getattr(function, "name", None):
+                    entry["name"] = function.name
+                arguments = getattr(function, "arguments", None)
+                if isinstance(arguments, str):
+                    entry["args"] = (entry["args"] or "") + arguments
+
+    @staticmethod
+    def _accumulate_function_call(
+        func_acc: dict[int, dict[str, Optional[str]]],
+        choice_index: int,
+        function_call: Any,
+    ) -> None:
+        entry = func_acc.setdefault(  # mutable-ok: streaming function-call accumulator
+            choice_index, {"name": None, "args": ""}
+        )
+        if getattr(function_call, "name", None):
+            entry["name"] = function_call.name
+        arguments = getattr(function_call, "arguments", None)
+        if isinstance(arguments, str):
+            entry["args"] = (entry["args"] or "") + arguments
+
+    @staticmethod
+    async def _build_tool_calls(
+        choice_acc: dict[int, dict[str, Optional[str]]],
+        transform: "Callable[[str], Awaitable[str]]",
+    ) -> list[ChatCompletionDeltaToolCall]:
+        return [
+            ChatCompletionDeltaToolCall(
+                index=tool_index,
+                id=entry["id"],
+                type=entry["type"],
+                function=Function(
+                    name=entry["name"],
+                    arguments=(await transform(entry["args"]) if entry["args"] else ""),
+                ),
+            )
+            for tool_index, entry in sorted(choice_acc.items())
+        ]
+
+    @staticmethod
+    async def _build_function_call(
+        entry: Optional[dict[str, Optional[str]]],
+        transform: "Callable[[str], Awaitable[str]]",
+    ) -> Optional[FunctionCall]:
+        if entry is None:
+            return None
+        return FunctionCall(
+            name=entry["name"],
+            arguments=await transform(entry["args"]) if entry["args"] else "",
+        )
+
+    async def _rewrite_chat_chunk(
+        self,
+        chunk: ModelResponseStream,
+        content_buffers: dict[int, str],
+        tool_acc: dict[int, dict[int, dict[str, Optional[str]]]],
+        func_acc: dict[int, dict[str, Optional[str]]],
+        transform: "Callable[[str], Awaitable[str]]",
+        split: "Callable[[str, bool], tuple[str, str]]",
+    ) -> None:
+        """Transform one streaming chat chunk in place: text content is masked /
+        unmasked and emitted as soon as ``split`` deems a prefix safe, while
+        tool-call and function-call argument fragments are accumulated and
+        emitted, fully transformed, on the chunk that closes the choice."""
+        for choice in chunk.choices:
+            index = getattr(choice, "index", 0)
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+            terminal = bool(getattr(choice, "finish_reason", None))
+
+            tool_calls = getattr(delta, "tool_calls", None)
+            if tool_calls:
+                self._accumulate_tool_calls(tool_acc, index, tool_calls)
+                delta.tool_calls = None
+            function_call = getattr(delta, "function_call", None)
+            if function_call is not None:
+                self._accumulate_function_call(func_acc, index, function_call)
+                delta.function_call = None
+
+            raw_content = getattr(delta, "content", None)
+            content = raw_content if isinstance(raw_content, str) else None
+            if content is not None or terminal:
+                emit, hold = split(
+                    content_buffers.pop(index, "") + (content or ""), terminal
+                )
+                if hold:
+                    content_buffers[index] = hold
+                if emit:
+                    delta.content = await transform(emit)
+                else:
+                    delta.content = None if content is None else ""
+
+            if terminal:
+                built_tool_calls = await self._build_tool_calls(
+                    tool_acc.pop(index, {}), transform
+                )
+                if built_tool_calls:
+                    delta.tool_calls = built_tool_calls
+                built_function_call = await self._build_function_call(
+                    func_acc.pop(index, None), transform
+                )
+                if built_function_call is not None:
+                    delta.function_call = built_function_call
+
+    @staticmethod
+    async def _build_tail_chunk(
+        template: Optional[ModelResponseStream],
+        content_buffers: dict[int, str],
+        tool_acc: dict[int, dict[int, dict[str, Optional[str]]]],
+        func_acc: dict[int, dict[str, Optional[str]]],
+        transform: "Callable[[str], Awaitable[str]]",
+    ) -> Optional[ModelResponseStream]:
+        """Flush any content / tool-call state still held when a stream ends
+        without a finish-reason chunk to attach it to."""
+        if template is None:
+            return None
+        cls = _OPTIONAL_PresidioPIIMasking
+        choices: list[StreamingChoices] = []
+        for index in sorted(set(content_buffers) | set(tool_acc) | set(func_acc)):
+            held = content_buffers.get(index, "")
+            masked_content = await transform(held) if held else None
+            built_tool_calls = await cls._build_tool_calls(
+                tool_acc.get(index, {}), transform
+            )
+            built_function_call = await cls._build_function_call(
+                func_acc.get(index), transform
+            )
+            if (
+                masked_content is None
+                and not built_tool_calls
+                and built_function_call is None
+            ):
+                continue
+            choices.append(
+                StreamingChoices(
+                    index=index,
+                    delta=Delta(
+                        content=masked_content,
+                        tool_calls=built_tool_calls or None,
+                        function_call=built_function_call,
+                    ),
+                )
+            )
+        if not choices:
+            return None
+        return ModelResponseStream(
+            id=getattr(template, "id", None),
+            created=getattr(template, "created", None),
+            model=getattr(template, "model", None),
+            object="chat.completion.chunk",
+            choices=choices,
+        )
+
+    @staticmethod
+    def _redacted_chunk(chunk: ModelResponseStream) -> ModelResponseStream:
+        """Fail closed when masking a chunk raises: rebuild it with empty content
+        but its original ``finish_reason`` and choice indices preserved, so
+        possibly-unmasked PII never reaches the client yet a terminal chunk still
+        carries the completion signal instead of being dropped."""
+        return ModelResponseStream(
+            id=chunk.id,
+            created=chunk.created,
+            model=chunk.model,
+            object="chat.completion.chunk",
+            choices=[
+                StreamingChoices(
+                    index=choice.index,
+                    delta=Delta(content=None),
+                    finish_reason=choice.finish_reason,
+                )
+                for choice in chunk.choices
+            ],
+        )
+
     async def _stream_apply_output_masking(
         self,
         response: Any,
         request_data: dict,
     ) -> AsyncGenerator[Union[ModelResponseStream, bytes], None]:
         """Apply Presidio masking to streaming output (apply_to_output=True path)."""
-        from litellm.llms.base_llm.base_model_iterator import (
-            convert_model_response_to_streaming,
+        presidio_config = self.get_presidio_settings_from_request_data(
+            request_data or {}
         )
-        from litellm.main import stream_chunk_builder
-        from litellm.types.utils import ModelResponse
 
-        all_chunks: List[ModelResponseStream] = []
-        passthrough_due_to_unknown_stream_shape = False
+        async def transform(text: str) -> str:
+            return await self.check_pii(
+                text=text,
+                output_parse_pii=False,
+                presidio_config=presidio_config,
+                request_data=request_data,
+            )
+
+        def split(text: str, terminal: bool) -> tuple[str, str]:
+            if terminal:
+                return text, ""
+            index = self._mask_flush_index(text)
+            return text[:index], text[index:]
+
+        content_buffers: dict[int, str] = {}
+        tool_acc: dict[int, dict[int, dict[str, Optional[str]]]] = {}
+        func_acc: dict[int, dict[str, Optional[str]]] = {}
+        last_chunk: Optional[ModelResponseStream] = None
+        masked_any_content = False
+        saw_unmaskable_shape = False
         try:
             async for chunk in response:
-                if isinstance(chunk, ModelResponseStream):
-                    if passthrough_due_to_unknown_stream_shape:
-                        yield chunk
-                    else:
-                        all_chunks.append(chunk)
-                elif isinstance(chunk, bytes):
-                    yield chunk  # type: ignore[misc]
-                    continue
-                else:
-                    if all_chunks:
-                        # Flush buffered chunks and switch to transparent passthrough for this stream shape.
-                        # NOTE: these buffered chunks are emitted unmasked because this
-                        # stream mixed chunk types and cannot be safely reconstructed.
-                        verbose_proxy_logger.warning(
-                            "Presidio apply_to_output: mixed stream detected (ModelResponseStream + unknown event). "
-                            "Flushing %d buffered chunks without PII masking and switching to transparent passthrough.",
-                            len(all_chunks),
-                        )
-                        for buffered_chunk in all_chunks:
-                            yield buffered_chunk
-                        all_chunks = []
-                    passthrough_due_to_unknown_stream_shape = True
+                if not isinstance(chunk, ModelResponseStream):
+                    # Flush buffered masked content before forwarding a non-chat
+                    # shape (raw bytes / a /v1/responses event) so the client
+                    # never sees a later event ahead of earlier masked text.
+                    tail = await self._build_tail_chunk(
+                        last_chunk, content_buffers, tool_acc, func_acc, transform
+                    )
+                    if tail is not None:
+                        yield tail
+                    content_buffers.clear()
+                    tool_acc.clear()
+                    func_acc.clear()
+                    saw_unmaskable_shape = True
                     yield chunk
-            if passthrough_due_to_unknown_stream_shape:
-                verbose_proxy_logger.warning(
-                    "Presidio apply_to_output: streaming response contained unknown event objects "
-                    "(e.g. /v1/responses events). Output PII masking was skipped for this response."
-                )
-                return
-            if not all_chunks:
+                    continue
+                masked_any_content = True
+                last_chunk = chunk
+                try:
+                    await self._rewrite_chat_chunk(
+                        chunk, content_buffers, tool_acc, func_acc, transform, split
+                    )
+                except Exception as e:
+                    # Fail closed: a transient masking error redacts this chunk's
+                    # content (so possibly-unmasked PII never reaches the client)
+                    # but keeps its finish_reason and keeps the stream flowing,
+                    # rather than truncating the response or dropping a terminal
+                    # chunk's completion signal.
+                    verbose_proxy_logger.error(
+                        f"Error masking streaming PII chunk: {str(e)}"
+                    )
+                    content_buffers.clear()
+                    tool_acc.clear()
+                    func_acc.clear()
+                    yield self._redacted_chunk(chunk)
+                    continue
+                yield chunk
+
+            tail = await self._build_tail_chunk(
+                last_chunk, content_buffers, tool_acc, func_acc, transform
+            )
+            if tail is not None:
+                yield tail
+            if not masked_any_content and saw_unmaskable_shape:
                 verbose_proxy_logger.warning(
                     "Presidio apply_to_output: streaming response contained no "
-                    "ModelResponseStream chunks (e.g. raw SSE bytes or an empty "
-                    "upstream stream). Output PII masking was skipped for this "
-                    "response."
+                    "maskable chat content (e.g. raw SSE bytes or /v1/responses "
+                    "events). Output PII masking was skipped for this response."
                 )
-                return
-
-            assembled_model_response = stream_chunk_builder(
-                chunks=all_chunks, messages=request_data.get("messages")
-            )
-
-            if not isinstance(assembled_model_response, ModelResponse):
-                for chunk in all_chunks:
-                    yield chunk
-                return
-
-            await self._process_response_for_pii(
-                response=assembled_model_response,
-                request_data=request_data,
-                mode="mask",
-            )
-
-            mock_response_stream = convert_model_response_to_streaming(
-                assembled_model_response
-            )
-            yield mock_response_stream
-
         except Exception as e:
             verbose_proxy_logger.error(f"Error masking streaming PII output: {str(e)}")
-            for chunk in all_chunks:
-                yield chunk
 
     @staticmethod
     def _unmask_sse_bytes_chunk(chunk: bytes, pii_tokens: Dict[str, str]) -> bytes:
@@ -1303,78 +1548,68 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         request_data: dict,
     ) -> AsyncGenerator[Union[ModelResponseStream, bytes], None]:
         """Apply PII unmasking to streaming output (output_parse_pii=True path)."""
-        from litellm.llms.base_llm.base_model_iterator import (
-            convert_model_response_to_streaming,
-        )
-        from litellm.main import stream_chunk_builder
-        from litellm.types.utils import ModelResponse
-
         metadata = (request_data.get("metadata") or {}) if request_data else {}
         pii_tokens: Dict[str, str] = metadata.get("pii_tokens", {})
 
-        remaining_chunks: List[ModelResponseStream] = []
-        saw_non_chat_chunk = False
+        async def transform(text: str) -> str:
+            return self._unmask_pii_text(text, pii_tokens)
+
+        def split(text: str, terminal: bool) -> tuple[str, str]:
+            if terminal:
+                return text, ""
+            hold = self._unmask_hold_len(text, pii_tokens.keys())
+            return (text[: len(text) - hold], text[len(text) - hold :])
+
+        content_buffers: dict[int, str] = {}
+        tool_acc: dict[int, dict[int, dict[str, Optional[str]]]] = {}
+        func_acc: dict[int, dict[str, Optional[str]]] = {}
+        last_chunk: Optional[ModelResponseStream] = None
         try:
             async for chunk in response:
-                if isinstance(chunk, ModelResponseStream):
-                    if saw_non_chat_chunk:
-                        yield chunk
-                    else:
-                        remaining_chunks.append(chunk)
-                elif isinstance(chunk, bytes):
-                    if pii_tokens:
-                        yield self._unmask_sse_bytes_chunk(chunk, pii_tokens)  # type: ignore[misc]
-                    else:
-                        yield chunk  # type: ignore[misc]
+                if isinstance(chunk, bytes):
+                    tail = await self._build_tail_chunk(
+                        last_chunk, content_buffers, tool_acc, func_acc, transform
+                    )
+                    if tail is not None:
+                        yield tail
+                    content_buffers.clear()
+                    tool_acc.clear()
+                    func_acc.clear()
+                    yield (  # type: ignore[misc]
+                        self._unmask_sse_bytes_chunk(chunk, pii_tokens)
+                        if pii_tokens
+                        else chunk
+                    )
                     continue
-                else:
-                    # /v1/responses events: unmask response.completed text in-place.
-                    # A mixed stream can't be reassembled, so flush buffered chat
-                    # chunks in order before passthrough instead of dropping them.
-                    if remaining_chunks and not saw_non_chat_chunk:
-                        for buffered_chunk in remaining_chunks:
-                            yield buffered_chunk
-                        remaining_chunks = []
-                    chunk_type = getattr(chunk, "type", None)
-                    if chunk_type == "response.completed" and pii_tokens:
+                if not isinstance(chunk, ModelResponseStream):
+                    tail = await self._build_tail_chunk(
+                        last_chunk, content_buffers, tool_acc, func_acc, transform
+                    )
+                    if tail is not None:
+                        yield tail
+                    content_buffers.clear()
+                    tool_acc.clear()
+                    func_acc.clear()
+                    if (
+                        getattr(chunk, "type", None) == "response.completed"
+                        and pii_tokens
+                    ):
                         self._unmask_responses_api_completed_chunk(chunk, pii_tokens)
-                    saw_non_chat_chunk = True
                     yield chunk
+                    continue
+                last_chunk = chunk
+                await self._rewrite_chat_chunk(
+                    chunk, content_buffers, tool_acc, func_acc, transform, split
+                )
+                yield chunk
 
-            if saw_non_chat_chunk:
-                return
-
-            if not remaining_chunks:
-                return
-
-            assembled_model_response = stream_chunk_builder(
-                chunks=remaining_chunks, messages=request_data.get("messages")
+            tail = await self._build_tail_chunk(
+                last_chunk, content_buffers, tool_acc, func_acc, transform
             )
-
-            if not isinstance(assembled_model_response, ModelResponse):
-                for chunk in remaining_chunks:
-                    yield chunk
-                return
-
-            self._preserve_usage_from_last_chunk(
-                assembled_model_response, remaining_chunks
-            )
-
-            await self._process_response_for_pii(
-                response=assembled_model_response,
-                request_data=request_data,
-                mode="unmask",
-            )
-
-            mock_response_stream = convert_model_response_to_streaming(
-                assembled_model_response
-            )
-            yield mock_response_stream
-
+            if tail is not None:
+                yield tail
         except Exception as e:
             verbose_proxy_logger.error(f"Error in PII streaming processing: {str(e)}")
-            for chunk in remaining_chunks:
-                yield chunk
 
     async def async_post_call_streaming_iterator_hook(  # type: ignore[override]
         self,
@@ -1409,17 +1644,6 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
         async for chunk in self._stream_pii_unmasking(response, request_data):
             yield chunk
-
-    @staticmethod
-    def _preserve_usage_from_last_chunk(
-        assembled_model_response: Any,
-        chunks: List[Any],
-    ) -> None:
-        """Copy usage metadata from the last chunk when stream_chunk_builder misses it."""
-        if not getattr(assembled_model_response, "usage", None) and chunks:
-            last_chunk_usage = getattr(chunks[-1], "usage", None)
-            if last_chunk_usage:
-                setattr(assembled_model_response, "usage", last_chunk_usage)
 
     def get_presidio_settings_from_request_data(
         self, data: dict
